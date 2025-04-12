@@ -1,0 +1,346 @@
+#!/usr/bin/env python
+
+'''
+MIT License
+
+Copyright (c) 2025 Michel Hermier
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+'''
+
+import argparse
+from collections import deque
+from dataclasses import dataclass
+from enum import Flag, auto
+import itertools
+import re
+import sys
+import textwrap
+
+__version_info__ = ('0','0','0')
+__version__      = '.'.join(__version_info__)
+
+class _Category(Flag):
+  HEADER = auto()
+  ENTRY = auto()
+  FOOTER = auto()
+
+  HEAD_ENTRY = HEADER | ENTRY
+  FOOT_ENTRY = FOOTER | ENTRY
+
+@dataclass
+class _CategorizedLine:
+  index: int
+  category: _Category
+  line: str
+
+# Remove when zip supports named tuple
+def _zip(*args, tuple = tuple, **kwargs):
+  for values in zip(*args, **kwargs):
+    yield tuple(*values)
+
+def _categorize(iterable, header, head, foot, footer):
+  tail = deque([], footer + foot) if footer + foot > 0 else None
+  for current in _zip(itertools.count(1),
+                      itertools.repeat(None),
+                      iterable,
+                      tuple = _CategorizedLine):
+    if current.index <= header:
+      current.category = _Category.HEADER
+      yield current
+      continue
+
+    if current.index <= header + head:
+      current.category = _Category.HEAD_ENTRY
+      yield current
+      continue
+
+    if tail is None:
+      current.category = _Category.ENTRY
+      yield current
+      continue
+
+    # Try to fill the tail backlog
+    if len(tail) < tail.maxlen:
+      tail.append(current)
+      continue
+
+    # Shift in the tail queue (FIFO)
+    to_append = current
+    current = tail.popleft()
+    tail.append(to_append)
+
+    current.category = _Category.ENTRY
+    yield current
+
+  if tail:      
+    while len(tail) > footer:
+      current = tail.popleft()
+      current.category = _Category.FOOT_ENTRY
+      yield current
+
+    while len(tail) > 0:
+      current = tail.popleft()
+      current.category = _Category.FOOTER
+      yield current
+
+def summary(header = 0, head = None, foot = None, footer = 0,
+            count = False, count_matched = False, count_skipped = False,
+            unary_predicate = None,
+            show_header = True, show_skipped = True, show_footer = True,
+            stdin = sys.stdin, stdout = sys.stdout):
+
+  # Default configuration if none is provided
+  if head is None and foot is None and unary_predicate is None:
+    head = 10
+    foot = 5
+
+  if head is None: head = 0
+  if foot is None: foot = 0
+
+  if unary_predicate is None: unary_predicate = lambda *_: False
+
+  def show_skipped(current_index):
+    if (not show_skipped):
+      return
+
+    if (previous_line is None):
+      entries_skipped = current_index -1
+    else:
+      entries_skipped = current_index - previous_line.index - 1
+
+    if entries_skipped <= 0:
+      return
+
+    if count_skipped:
+      stdout.write(f"... {entries_skipped} entries skipped\n")
+    else:
+      stdout.write(f"...\n")
+
+  first_entry = None
+  last_entry = None
+  entries_matched = 0
+
+  previous_line = None
+  for current in _categorize(stdin, header, head, foot, footer):
+    write_line = None
+
+    #stdout.write(str(current) + '\n')
+
+    if current.category == _Category.HEADER:
+      write_line = show_header
+
+    if current.category & _Category.ENTRY:
+      if first_entry is None:
+        first_entry = current
+      last_entry = current
+
+      if write_line := current.category & ~_Category.ENTRY or unary_predicate(current):
+        entries_matched += 1
+      else:
+        continue
+
+    if current.category == _Category.FOOTER:
+      write_line = show_footer
+
+    # Reaching this point mean that the current line is considered for writing,
+    # whether or not it is finally written
+    show_skipped(current.index)
+    previous_line = current
+
+    assert write_line is not None
+    if write_line:
+      stdout.write(current.line)
+
+  # Required when there is trayling skipped entries and no footer
+  show_skipped(current.index + 1 if current is not None else 0)
+
+  entries_count = last_entry.index - first_entry.index + 1 if first_entry is not None else 0
+
+  if count and count_matched:
+    stdout.write(f"{entries_matched}/{entries_count} entries matched\n")
+  elif count_matched:
+    stdout.write(f"{entries_matched} entries matched\n")
+  elif count:
+    stdout.write(f"{entries_count} entries found\n")
+
+def summary_files(*args, filenames = None, verbose = None,
+      stdin = sys.stdin, stdout = sys.stdout, stderr = sys.stderr, **kwargs):
+  if filenames is None or len(filenames) == 0:
+    filenames = ['-'] # Default to stdin
+  if verbose is None:
+    verbose = len(filenames) > 1
+
+  for filename in filenames: 
+    try:
+      if filename == '-':
+        if verbose:
+          stdout.write('==> standard input <==\n')
+        summary(*args, stdin = stdin, stdout = stdout, **kwargs)
+      else:
+        if verbose:
+          stdout.write(f"==> {filename} <==\n")
+        with open(filename, 'r') as file:
+          summary(*args, stdin = file, stdout = stdout, **kwargs)
+    except IOError as _err:
+      stderr.write(filename + ": " + _err.strerror)
+    except KeyboardInterrupt: # Catch ^C
+      stdout.write("\n")
+      return
+
+def positive_int(value):
+  ivalue = int(value)
+  if ivalue <= 0:
+      raise argparse.ArgumentTypeError("%s is an invalid positive int value" % value)
+  return ivalue
+
+def regexp_validator(value):
+  pattern = re.compile(value)
+  return lambda entry: pattern.search(entry.line) is not None
+
+_parser = argparse.ArgumentParser(
+    formatter_class = argparse.RawDescriptionHelpFormatter,
+    description     = textwrap.dedent('''
+        Print the summuary of each FILE to standard output.
+        With more than one FILE, precede each with a header giving the file name.
+
+        With no FILE, or when FILE is -, read standard input.
+        '''),
+    epilog          = textwrap.dedent('''
+        A simple text summarizer, to help extract 'interesing' lines from listings.
+
+        A mix of head/tail/grep combined.
+        '''),
+    add_help = False,
+  )
+_parser.add_argument(
+    '--help',
+    help    = 'show this help message and exit',
+    action  = 'help',
+  )
+_parser.add_argument(
+    '-H',
+    '--header',
+    metavar = 'N',
+    help    = 'number of line of the header (default: 0)',
+    type    = positive_int,
+    default = 0,
+  )
+_parser.add_argument(
+    '-h',
+    '--head',
+    metavar = 'N',
+    help    = 'number of line of the head (default: 10)',
+    type    = positive_int,
+  )
+_parser.add_argument(
+    '-f',
+    '--foot',
+    '-t',
+    '--tail',
+    metavar = 'N',
+    help    = 'number of line of the foot (default: 10)',
+    type    = positive_int,
+  )
+_parser.add_argument(
+    '-F',
+    '--footer',
+    metavar = 'N',
+    help    = 'number of line of the footer (default: 0)',
+    type    = positive_int,
+    default = 0,
+  )
+_parser.add_argument(
+    '-c',
+    '--count',
+    help   = 'count the number of line between the header and the footer',
+    action = 'store_true',
+  )
+_parser.add_argument(
+    '-m',
+    '--count-matched',
+    help   = 'count the number of line matched between the header and the footer',
+    action = 'store_true',
+  )
+_parser.add_argument(
+    '-s',
+    '--count-skipped',
+    help   = 'count the number of line skipped',
+    action = 'store_true',
+  )
+_parser.add_argument(
+    '--hide-header',
+    help   = 'hide the header section',
+    dest   = 'show_header',
+    action = 'store_false',
+  )
+_parser.add_argument(
+    '--hide-skipped',
+    help   = 'hide the skipped sections',
+    dest   = 'show_skipped',
+    action = 'store_false',
+  )
+_parser.add_argument(
+    '--hide-footer',
+    help   = 'hide the footer section',
+    dest   = 'show_footer',
+    action = 'store_false',
+  )
+_parser.add_argument(
+    '--regexp',
+    metavar = 'REGEXP',
+    help    = 'match the lines between the header and the footer using a regular expression',
+    dest    = 'unary_predicate',
+    type    = regexp_validator,
+  )
+_parser.add_argument(
+    '-q',
+    '--quiet',
+    help    = 'never output additionnal headers giving file names',
+    dest    = 'verbose',
+    action  = 'store_false',
+    default = None,
+  )
+_parser.add_argument(
+    '-v',
+    '--verbose',
+    help    = 'always output additionnal headers giving file names',
+    dest    = 'verbose',
+    action  = 'store_true',
+    default = None,
+  )
+_parser.add_argument(
+    '-V',
+    '--version',
+    action  = 'version',
+    version = __version__,
+  )
+_parser.add_argument(
+    'filenames',
+    metavar = 'FILE',
+    help    = 'files to summarize',
+    nargs   = '*',
+  )
+
+def main():
+  args = _parser.parse_args()
+  summary_files(**vars(args))
+
+if __name__ == '__main__':
+  main()
